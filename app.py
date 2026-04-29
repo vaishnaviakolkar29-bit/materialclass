@@ -60,7 +60,7 @@ PALETTE = "#7c3aed"  # brand purple
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validate_columns(df: pd.DataFrame) -> list[str]:
+def validate_columns(df: pd.DataFrame) -> list:
     """Return list of missing required columns (empty = OK)."""
     required = FEATURE_COLS + [TARGET_CLF]
     return [c for c in required if c not in df.columns]
@@ -76,7 +76,7 @@ def load_data(raw_bytes: bytes) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
-def train_classifier(df_hash: int, X: np.ndarray, y: np.ndarray, classes: list):
+def train_classifier(df_hash: int, X: np.ndarray, y: np.ndarray, classes: tuple):
     """Train RandomForest classifier, return model + metrics."""
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
@@ -86,12 +86,16 @@ def train_classifier(df_hash: int, X: np.ndarray, y: np.ndarray, classes: list):
 
     y_pred = clf.predict(X_te)
     acc    = accuracy_score(y_te, y_pred)
-    report = classification_report(y_te, y_pred, target_names=classes, output_dict=True)
-    cm     = confusion_matrix(y_te, y_pred, labels=classes)
+
+    # y_te and y_pred are integer-encoded — use integer labels for confusion matrix
+    int_labels = list(range(len(classes)))
+    report = classification_report(y_te, y_pred, labels=int_labels,
+                                   target_names=list(classes), output_dict=True)
+    cm     = confusion_matrix(y_te, y_pred, labels=int_labels)  # ✅ fixed
     cv_acc = cross_val_score(clf, X, y, cv=5, scoring="accuracy").mean()
 
     return clf, {"accuracy": acc, "cv_accuracy": cv_acc,
-                 "report": report, "cm": cm, "X_te": X_te,
+                 "report": report, "cm": cm,
                  "y_te": y_te, "y_pred": y_pred}
 
 
@@ -191,32 +195,34 @@ def plot_class_distribution(y: pd.Series) -> plt.Figure:
 # Streamlit UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_metric_row(metrics: list[tuple]):
+def render_metric_row(metrics: list):
     """Render a row of st.metric cards from a list of (label, value) tuples."""
     cols = st.columns(len(metrics))
     for col, (label, value) in zip(cols, metrics):
         col.metric(label, value)
 
 
-def prediction_panel(clf, reg, classes: list):
+def prediction_panel(clf, reg, le: LabelEncoder, classes: list):
     st.subheader("🔬 Interactive Prediction")
     st.caption("Adjust material properties and get an instant prediction.")
 
     c1, c2 = st.columns(2)
     with c1:
-        density  = st.slider("Density (kg/m³)",               500,  20000,  5000, step=50)
-        tensile  = st.slider("Tensile Strength (MPa)",           1,   2000,   300, step=5)
-        hardness = st.slider("Hardness (HB)",                    1,   1000,   100, step=5)
+        density  = st.slider("Density (kg/m³)",            500,  20000,  5000, step=50)
+        tensile  = st.slider("Tensile Strength (MPa)",        1,   2000,   300, step=5)
+        hardness = st.slider("Hardness (HB)",                 1,   1000,   100, step=5)
     with c2:
-        thermal  = st.slider("Thermal Conductivity (W/mK)",    0.1,  500.0,  50.0, step=0.5)
-        elastic  = st.slider("Elastic Modulus (GPa)",            1,   1000,   100, step=5)
+        thermal  = st.slider("Thermal Conductivity (W/mK)", 0.1,  500.0,  50.0, step=0.5)
+        elastic  = st.slider("Elastic Modulus (GPa)",         1,   1000,   100, step=5)
 
     inp_clf = pd.DataFrame(
         [[density, tensile, hardness, thermal, elastic]], columns=FEATURE_COLS
     )
     inp_reg = inp_clf[REG_FEATURES]
 
-    mat_type     = clf.predict(inp_clf)[0]
+    # Predict — clf returns integer, decode to class name via LabelEncoder
+    mat_enc      = clf.predict(inp_clf)[0]
+    mat_type     = le.inverse_transform([mat_enc])[0]
     mat_proba    = clf.predict_proba(inp_clf)[0]
     tensile_pred = reg.predict(inp_reg)[0]
 
@@ -225,7 +231,7 @@ def prediction_panel(clf, reg, classes: list):
     r1.success(f"**Predicted Material:** {mat_type}")
     r2.info(f"**Predicted Tensile Strength:** {tensile_pred:.1f} MPa")
 
-    # Confidence bar chart
+    # Confidence bar chart — probabilities are ordered by clf.classes_ (integers)
     prob_df = (
         pd.DataFrame({"Probability": mat_proba}, index=classes)
         .sort_values("Probability", ascending=False)
@@ -285,25 +291,21 @@ def main():
 
     df = df.dropna(subset=FEATURE_COLS + [TARGET_CLF]).reset_index(drop=True)
 
-    # ── Train models ──────────────────────────────────────────────────────────
-    X_clf   = df[FEATURE_COLS].values
-    y_clf   = df[TARGET_CLF].values
+    # ── Encode labels ─────────────────────────────────────────────────────────
     classes = sorted(df[TARGET_CLF].unique().tolist())
+    le      = LabelEncoder().fit(classes)
+    y_enc   = le.transform(df[TARGET_CLF].values)
 
-    le     = LabelEncoder().fit(classes)
-    y_enc  = le.transform(y_clf)
-
+    X_clf = df[FEATURE_COLS].values
     X_reg = df[REG_FEATURES].values
     y_reg = df[TARGET_REG].values
 
     df_hash = hash(raw_bytes)  # stable cache key
 
     with st.spinner("Training models…"):
-        clf, clf_metrics = train_classifier(df_hash, X_clf, y_enc, classes)
+        # Pass classes as tuple so it's hashable for @st.cache_resource
+        clf, clf_metrics = train_classifier(df_hash, X_clf, y_enc, tuple(classes))
         reg, reg_metrics = train_regressor(df_hash, X_reg, y_reg)
-
-    # Decode label indices back to class names
-    clf.classes_ = np.array(classes)  # ensure string class names on clf
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
     tab_predict, tab_clf, tab_reg, tab_data = st.tabs(
@@ -314,7 +316,7 @@ def main():
     # TAB 1 — Predict
     # ──────────────────────────────────────────────────────────────────────────
     with tab_predict:
-        prediction_panel(clf, reg, classes)
+        prediction_panel(clf, reg, le, classes)
 
     # ──────────────────────────────────────────────────────────────────────────
     # TAB 2 — Classifier
@@ -323,10 +325,10 @@ def main():
         st.subheader("Classification Performance")
 
         render_metric_row([
-            ("Test Accuracy",       f"{clf_metrics['accuracy']*100:.2f}%"),
+            ("Test Accuracy",        f"{clf_metrics['accuracy']*100:.2f}%"),
             ("CV Accuracy (5-fold)", f"{clf_metrics['cv_accuracy']*100:.2f}%"),
-            ("Classes",             str(len(classes))),
-            ("Training samples",    str(int(len(df) * 0.8))),
+            ("Classes",              str(len(classes))),
+            ("Training samples",     str(int(len(df) * 0.8))),
         ])
 
         st.divider()
@@ -362,10 +364,10 @@ def main():
         st.subheader("Regression Performance — Tensile Strength (MPa)")
 
         render_metric_row([
-            ("RMSE",              f"{reg_metrics['rmse']:.2f} MPa"),
-            ("MSE",               f"{reg_metrics['mse']:.2f}"),
-            ("R² Score",          f"{reg_metrics['r2']:.4f}"),
-            ("CV R² (5-fold)",    f"{reg_metrics['cv_r2']:.4f}"),
+            ("RMSE",           f"{reg_metrics['rmse']:.2f} MPa"),
+            ("MSE",            f"{reg_metrics['mse']:.2f}"),
+            ("R² Score",       f"{reg_metrics['r2']:.4f}"),
+            ("CV R² (5-fold)", f"{reg_metrics['cv_r2']:.4f}"),
         ])
 
         st.divider()
